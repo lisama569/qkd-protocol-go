@@ -64,7 +64,7 @@ func Run(cfg Config) (Result, error) {
 	// 8. 隐私放大（仅真实执行；容量预估不会走到这里）。
 	finalBits, paErr := PrivacyAmplify(prep.rec.Key, prep.outBits, prep.src)
 	if paErr != nil {
-		return prep.resultView(), paErr
+		return prep.resultView(), withStage(StagePrivacyAmplify, paErr)
 	}
 	ledger := prep.ledger
 	ledger.Final = prep.outBits
@@ -142,7 +142,9 @@ func prepareSession(cfg Config) (preparedRun, error) {
 		}
 	}
 	if len(remaining) == 0 {
-		return p, ErrInsufficientKeyMaterial
+		// 抽样阶段就把剩余材料抽光：失败发生在 qber_estimate 阶段，
+		// 必须按实际到达阶段标记，审计不得误记到 accounting 阶段。
+		return p, withStage(StageQBEREstimate, ErrInsufficientKeyMaterial)
 	}
 
 	// 5. 取出抽样剩余部分做误码纠正。

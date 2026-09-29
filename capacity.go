@@ -15,6 +15,7 @@ const (
 	CapacityExhausted             = "exhausted"
 	CapacityLowYield              = "low_yield"
 	CapacityInsufficientForTarget = "insufficient_for_target"
+	CapacityInternalError         = "internal_error"
 )
 
 // ErrInvalidTarget 表示容量预估的目标长度非法（负数）。
@@ -55,12 +56,14 @@ func EstimateCapacity(cfg Config, targetKeyBytes int) (CapacityEstimate, error) 
 	e := CapacityEstimate{
 		Params:        summarizeParams(c),
 		RequestedBits: targetKeyBytes * 8,
+		// 阈值取“本次真正生效的判定阈值”（已应用缺省语义），与 Params 摘要中
+		// 的阈值始终一致；它不随实测 QBER 漂移，参数非法或早期失败时也不会变成 0。
+		QBERThreshold: c.QBERThreshold,
 	}
 
 	prep, err := prepareSession(run)
 	e.Counts = ledgerCounts(prep.ledger)
 	e.QBER = prep.est.QBER
-	e.QBERThreshold = prep.est.QBER
 	avail := prep.ledger.FinalKeyLen()
 	e.AvailableBits = avail
 	if avail > 0 {
@@ -110,12 +113,17 @@ func EstimateCapacity(cfg Config, targetKeyBytes int) (CapacityEstimate, error) 
 				"insufficient for target: available=%d byteAligned=%d < requested=%d bits; a shorter key is possible, target is not auto-shortened",
 				avail, e.ByteAlignedBits, e.RequestedBits)
 		}
+	case OutcomeInternalError:
+		// 内部错误的原始文本可能含敏感比特，只保留固定公开说明，不转发原文。
+		e.Verdict = CapacityInternalError
+		e.Reason = InternalErrorPublicReason
 	default:
-		// 理论上 prepareSession 不会产生其它错误；保守归类，不伪造可行性。
-		e.Verdict = outcome
+		// 理论上 prepareSession 不会产生其它错误；保守归类，不伪造可行性、不转发原文。
+		e.Verdict = CapacityInternalError
+		e.Reason = InternalErrorPublicReason
 	}
 	if e.Reason == "" {
-		e.Reason = err.Error()
+		e.Reason = publicFailureReason(outcome, err)
 	}
 	return e, nil
 }

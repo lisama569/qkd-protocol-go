@@ -108,27 +108,84 @@ func ledgerCounts(l Ledger) PublicCounts {
 	}
 }
 
+// String 输出公开计数的单行形式（仅数量口径，绝无比特内容）。
+func (c PublicCounts) String() string {
+	return fmt.Sprintf(
+		"prepared=%d detected=%d sifted=%d sampled=%d after=%d leakEC=%d leakEst=%d margin=%d final=%d discarded=%d",
+		c.Prepared, c.Detected, c.Sifted, c.Sampled, c.AfterSample,
+		c.LeakedEC, c.LeakedEst, c.Margin, c.Final, c.Discarded)
+}
+
+// 内部错误的固定公开说明：内部错误属于实现自身故障，其原始文本可能夹带
+// 纠正后比特、筛后比特等敏感内容，因此对外只保留固定类别与固定说明，
+// 绝不转发 err.Error() 原文（NewAudit 与容量预估共用此口径）。
+const InternalErrorPublicReason = "internal error: unexpected implementation failure; no key material released"
+
+// stageCarrier 由携带“错误实际发生阶段”的错误实现。
+type stageCarrier interface {
+	error
+	errorStage() string
+}
+
+// stagedError 把错误标记到流程实际推进到的阶段上，只影响阶段归类，
+// 不改变 errors.Is/errors.As 对底层错误的识别。
+type stagedError struct {
+	stage string
+	err   error
+}
+
+func (e *stagedError) Error() string      { return e.err.Error() }
+func (e *stagedError) Unwrap() error      { return e.err }
+func (e *stagedError) errorStage() string { return e.stage }
+
+// withStage 标记 err 实际发生的阶段（err 为 nil 时透传 nil）。
+func withStage(stage string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &stagedError{stage: stage, err: err}
+}
+
 // classifyError 把流程错误映射为 (粗类别, 阶段)。未知错误归 internal_error。
+// 若错误显式携带阶段标记（如抽样阶段抽光材料），阶段以标记为准，
+// 保证审计阶段与真实执行到达的阶段一致；否则使用各类别的规范默认阶段。
 func classifyError(err error) (outcome, stage string) {
+	var marked stageCarrier
+	hasMarkedStage := errors.As(err, &marked)
+
 	var ve *ValidationError
 	switch {
 	case errors.As(err, &ve):
-		return OutcomeInvalidConfig, StageValidate
+		outcome, stage = OutcomeInvalidConfig, StageValidate
 	case errors.Is(err, ErrNoSignal):
-		return OutcomeNoSignal, StageSift
-	}
-	var abort *AbortError
-	if errors.As(err, &abort) {
-		return OutcomeAbortedInsecure, StageQBEREstimate
-	}
-	switch {
-	case errors.Is(err, ErrReconciliationFailed):
-		return OutcomeReconcileFailed, StageReconcile
-	case errors.Is(err, ErrInsufficientKeyMaterial):
-		return OutcomeInsufficient, StageAccounting
+		outcome, stage = OutcomeNoSignal, StageSift
 	default:
-		return OutcomeInternalError, StageAccounting
+		var abort *AbortError
+		switch {
+		case errors.As(err, &abort):
+			outcome, stage = OutcomeAbortedInsecure, StageQBEREstimate
+		case errors.Is(err, ErrReconciliationFailed):
+			outcome, stage = OutcomeReconcileFailed, StageReconcile
+		case errors.Is(err, ErrInsufficientKeyMaterial):
+			outcome, stage = OutcomeInsufficient, StageAccounting
+		default:
+			outcome, stage = OutcomeInternalError, StageAccounting
+		}
 	}
+	if hasMarkedStage {
+		stage = marked.errorStage()
+	}
+	return outcome, stage
+}
+
+// publicFailureReason 返回失败的对外人类可读说明：
+// 已知类别错误只含公开数值，可安全转发；内部错误可能夹带敏感比特内容，
+// 一律替换为固定公开说明。
+func publicFailureReason(outcome string, err error) string {
+	if outcome == OutcomeInternalError {
+		return InternalErrorPublicReason
+	}
+	return err.Error()
 }
 
 // NewAudit 依据 Run 的输入参数、公开结果与错误构造统一口径审计。
@@ -151,7 +208,7 @@ func NewAudit(cfg Config, res Result, err error) Audit {
 	outcome, stage := classifyError(err)
 	a.Outcome = outcome
 	a.Stage = stage
-	a.Reason = err.Error()
+	a.Reason = publicFailureReason(outcome, err)
 	if outcome == OutcomeInsufficient {
 		a.Detail = insufficientDetail(c, res.Ledger)
 	}

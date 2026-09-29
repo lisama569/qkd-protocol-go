@@ -1,0 +1,6 @@
+[
+  {"name":"success","n":4000,"loss":5,"eff":0.9,"dark":0.0001,"sample":0.5,"threshold":0.11,"margin":32,"key":16,"seed":1},
+  {"name":"abort","n":4000,"loss":5,"eff":0.9,"dark":0.0001,"eve":true,"key":16,"seed":1},
+  {"name":"no-signal","n":100,"loss":40,"eff":0.9,"dark":0.000000000001,"key":0,"seed":1},
+  {"name":"sampled-out","n":200,"loss":5,"eff":0.9,"dark":0.0001,"sample":0.999,"key":0,"seed":1}
+]
