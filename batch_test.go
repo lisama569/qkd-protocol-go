@@ -169,3 +169,42 @@ func outcomesEqual(a, b BatchOutcome) bool {
 	}
 	return fmt.Sprintf("%x", a.Key) == fmt.Sprintf("%x", b.Key)
 }
+
+// 改变分组顺序与并发度：逐位置/逐 Name 比对，审计全字段（含阶段、阈值、
+// QBER、公开计数、KeyBits）与密钥必须完全一致。
+func TestBatchPerItemConsistencyAcrossOrderAndWorkers(t *testing.T) {
+	jobs := batchJobs()
+	ref := RunBatch(jobs, 1)
+
+	// 1) 仅改变并发度：同一下标位置逐项一致。
+	for _, w := range []int{0, 2, 4, 8, 100} {
+		got := RunBatch(jobs, w)
+		if len(got) != len(ref) {
+			t.Fatalf("workers=%d length=%d want %d", w, len(got), len(ref))
+		}
+		for i := range ref {
+			if got[i].Index != i || !outcomesEqual(ref[i], got[i]) {
+				t.Fatalf("workers=%d item %d diverged:\n ref=%s\n got=%s",
+					w, i, ref[i].Audit, got[i].Audit)
+			}
+		}
+	}
+
+	// 2) 改变分组顺序：按 Name 对照，每个参数组结果逐项一致。
+	shuffled := []BatchJob{jobs[3], jobs[6], jobs[0], jobs[5], jobs[2], jobs[4], jobs[1]}
+	got := RunBatch(shuffled, 3)
+	byName := map[string]BatchOutcome{}
+	for _, o := range ref {
+		byName[o.Name] = o
+	}
+	for pos, o := range got {
+		if o.Index != pos || o.Name != shuffled[pos].Name {
+			t.Fatalf("item not placed at submission index after reorder")
+		}
+		want := byName[o.Name]
+		if !outcomesEqual(want, o) {
+			t.Fatalf("group %q diverges across order:\n ref=%s\n got=%s",
+				o.Name, want.Audit, o.Audit)
+		}
+	}
+}

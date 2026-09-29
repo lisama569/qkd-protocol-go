@@ -60,7 +60,9 @@ func EstimateCapacity(cfg Config, targetKeyBytes int) (CapacityEstimate, error) 
 	prep, err := prepareSession(run)
 	e.Counts = ledgerCounts(prep.ledger)
 	e.QBER = prep.est.QBER
-	e.QBERThreshold = prep.est.QBER
+	// 阈值始终取本次真正生效的判定阈值（已应用缺省语义，与 Params.QBERThreshold
+	// 同源）：绝不跟随实测 QBER，参数非法或流程早退（prep.est 为零值）时也不变成 0。
+	e.QBERThreshold = c.QBERThreshold
 	avail := prep.ledger.FinalKeyLen()
 	e.AvailableBits = avail
 	if avail > 0 {
@@ -115,7 +117,12 @@ func EstimateCapacity(cfg Config, targetKeyBytes int) (CapacityEstimate, error) 
 		e.Verdict = outcome
 	}
 	if e.Reason == "" {
-		e.Reason = err.Error()
+		if outcome == OutcomeInternalError {
+			// 与 NewAudit 同口径：内部错误不转发可能含敏感内容的原文。
+			e.Reason = PublicInternalErrorReason
+		} else {
+			e.Reason = err.Error()
+		}
 	}
 	return e, nil
 }

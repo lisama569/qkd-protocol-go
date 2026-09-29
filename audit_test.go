@@ -3,6 +3,8 @@ package qkd
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -150,4 +152,76 @@ func TestAuditNoSignalKeepsPreparedCount(t *testing.T) {
 		t.Fatalf("expected no_signal with prepared=100, got %s counts=%+v", a.Outcome, a.Counts)
 	}
 	assertNoKeyLeak(t, a, res.Key)
+}
+
+// 抽样阶段把剩余材料抽光：类别仍是材料不足（细分 exhausted），
+// 但阶段必须按实际到达点归到 qber_estimate，而不是账目阶段。
+func TestAuditSamplingExhaustStage(t *testing.T) {
+	cfg := preset(1, func(c *Config) {
+		c.NumPhotons = 23
+		c.ChannelLossDB = 25
+		c.DarkCountProb = 1e-9
+		c.RequestedKeyBytes = 0
+	})
+	res, err := Run(cfg)
+	if !errors.Is(err, ErrInsufficientKeyMaterial) {
+		t.Fatalf("expected ErrInsufficientKeyMaterial, got %v", err)
+	}
+	if res.Ledger.Sifted <= 0 || res.Ledger.AfterSample != 0 {
+		t.Fatalf("fixture must exhaust material at sampling: %s", res.Ledger)
+	}
+	a := NewAudit(cfg, res, err)
+	if a.Outcome != OutcomeInsufficient || a.Detail != DetailExhausted {
+		t.Fatalf("got outcome=%s detail=%q; want insufficient/exhausted", a.Outcome, a.Detail)
+	}
+	if a.Stage != StageQBEREstimate {
+		t.Fatalf("sampling exhaust must classify at %s, got %s", StageQBEREstimate, a.Stage)
+	}
+	// errors.Is 穿透性：包装后调用方仍可按既有哨兵错误判定。
+	if !errors.Is(err, ErrInsufficientKeyMaterial) {
+		t.Fatalf("wrapped error must remain errors.Is ErrInsufficientKeyMaterial")
+	}
+	// 同一参数的容量预估阶段口径必须一致。
+	e, eerr := EstimateCapacity(cfg, 0)
+	if eerr != nil || e.Stage != StageQBEREstimate || e.Verdict != CapacityExhausted {
+		t.Fatalf("estimate stage=%s verdict=%s err=%v; want qber_estimate/exhausted",
+			e.Stage, e.Verdict, eerr)
+	}
+	assertNoKeyLeak(t, a, res.Key)
+}
+
+// 任意内部错误文本都不得出现在审计输出中：即使原文携带（模拟泄露的）
+// 纠正后比特/筛后比特，也只能看到固定公开类别与说明。
+func TestAuditInternalErrorWithholdsRawText(t *testing.T) {
+	secret := "10110010110111011000" // 模拟误带入错误文案的“纠正后比特”
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"plain", errors.New("boom: reconciled key=" + secret)},
+		{"fmt-wrapped", fmt.Errorf("corrected bits [%s] flushed", secret)},
+		{"nested", fmt.Errorf("outer: %w", errors.New("sifted bits "+secret))},
+	}
+	cfg := baseConfig()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := NewAudit(cfg, Result{}, tc.err)
+			if a.Outcome != OutcomeInternalError {
+				t.Fatalf("outcome=%s want internal_error", a.Outcome)
+			}
+			if a.Reason != PublicInternalErrorReason {
+				t.Fatalf("reason=%q want fixed public reason", a.Reason)
+			}
+			raw, merr := json.Marshal(a)
+			if merr != nil {
+				t.Fatalf("marshal: %v", merr)
+			}
+			text := string(raw) + a.String() + a.Reason
+			for _, banned := range []string{secret, "boom", "reconciled key", "corrected bits", "sifted bits", "outer"} {
+				if strings.Contains(text, banned) {
+					t.Fatalf("audit output leaks internal text %q: %s", banned, text)
+				}
+			}
+		})
+	}
 }

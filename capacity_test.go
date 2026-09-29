@@ -200,6 +200,80 @@ func TestEstimateMatchesRunSweep(t *testing.T) {
 	t.Logf("sweep verified %d (cfg,target) combinations", checked)
 }
 
+// 预估展示阈值必须始终等于本次真正生效的判定阈值：
+// 不随实测 QBER 变，参数非法/早退不归零，与 Params 摘要一致，与真实执行一致。
+func TestEstimateThresholdAlwaysEffective(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*Config)
+		target int
+		effThr float64 // 期望生效阈值（缺省 0.11）
+	}{
+		{"feasible", func(c *Config) {}, 16, DefaultQBERThreshold},
+		{"target-zero", func(c *Config) {}, 0, DefaultQBERThreshold},
+		{"target-too-large", func(c *Config) {}, 10000, DefaultQBERThreshold},
+		{"invalid-config", func(c *Config) { *c = Config{Seed: 1, DetectorEfficiency: 0.9} }, 16, DefaultQBERThreshold},
+		{"no-signal", func(c *Config) {
+			c.NumPhotons = 100
+			c.ChannelLossDB = 40
+			c.DarkCountProb = 1e-12
+		}, 0, DefaultQBERThreshold},
+		{"abort-eve", func(c *Config) { c.Eavesdrop = true }, 16, DefaultQBERThreshold},
+		{"exhausted", func(c *Config) { c.NumPhotons = 40; c.RequestedKeyBytes = 0 }, 0, DefaultQBERThreshold},
+		{"low-yield", func(c *Config) { c.NumPhotons = 640; c.RequestedKeyBytes = 0 }, 0, DefaultQBERThreshold},
+		{"custom-threshold-feasible", func(c *Config) { c.QBERThreshold = 0.2 }, 16, 0.2},
+		{"custom-threshold-zero-means-default", func(c *Config) { c.QBERThreshold = 0 }, 16, DefaultQBERThreshold},
+		{"sampling-exhausts-material", func(c *Config) {
+			c.NumPhotons = 23
+			c.ChannelLossDB = 25
+			c.DarkCountProb = 1e-9
+			c.RequestedKeyBytes = 0
+		}, 0, DefaultQBERThreshold},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := preset(1, tc.mutate)
+			origTarget := cfg.RequestedKeyBytes
+			e, err := EstimateCapacity(cfg, tc.target)
+			if err != nil {
+				t.Fatalf("EstimateCapacity: %v", err)
+			}
+			// 预估值 == 参数摘要值 == 缺省语义后的生效阈值，三者恒等。
+			if e.QBERThreshold != tc.effThr {
+				t.Fatalf("estimate threshold=%.4f want effective %.4f (verdict=%s qber=%.4f)",
+					e.QBERThreshold, tc.effThr, e.Verdict, e.QBER)
+			}
+			if e.Params.QBERThreshold != e.QBERThreshold {
+				t.Fatalf("summary threshold=%.4f != estimate threshold=%.4f",
+					e.Params.QBERThreshold, e.QBERThreshold)
+			}
+			// 关键回归：阈值绝不能等于实测 QBER（非零 QBER 时尤其明显）。
+			if e.QBER > 0 && e.QBERThreshold == e.QBER && e.QBER != tc.effThr {
+				t.Fatalf("threshold tracks measured QBER %.4f", e.QBER)
+			}
+			// 与真实执行的生效阈值一致。
+			run := cfg
+			run.RequestedKeyBytes = tc.target
+			res, rerr := Run(run)
+			audit := NewAudit(run, res, rerr)
+			if audit.QBERThreshold != e.QBERThreshold {
+				t.Fatalf("run audit threshold=%.4f != estimate threshold=%.4f",
+					audit.QBERThreshold, e.QBERThreshold)
+			}
+			// 目标仅作用于内部克隆：入参配置不被修改（含目标字段）。
+			if cfg.RequestedKeyBytes != origTarget {
+				t.Fatalf("caller config mutated: RequestedKeyBytes=%d want %d",
+					cfg.RequestedKeyBytes, origTarget)
+			}
+			// 对外采用的目标比特数必须与传入目标一致：不缩短、不放大。
+			if e.RequestedBits != tc.target*8 {
+				t.Fatalf("RequestedBits=%d want %d (target must not be shortened)",
+					e.RequestedBits, tc.target*8)
+			}
+		})
+	}
+}
+
 // 同种子下预估的公开计数与真实执行成功账目的公开计数一致。
 func TestEstimateCountsMatchSuccessfulRun(t *testing.T) {
 	cfg := baseConfig()

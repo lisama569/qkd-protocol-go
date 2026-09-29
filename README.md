@@ -12,14 +12,41 @@
 go build ./...
 go test -v ./...
 
-# 运行一次会话（默认无窃听、种子 1）
+# 运行一次会话（默认无窃听、种子 1）——不带 -mode 等价于 -mode run
 go run ./cmd/qkdsim -seed 1 -n 4000 -loss 5 -eff 0.9 -dark 0.0001 -key 16
 
 # 模拟窃听（拦截-重发），会话将被终止且不输出密钥
 go run ./cmd/qkdsim -seed 1 -n 4000 -eve
+
+# 容量预估：同一组参数，不实际出钥，打印结论/生效阈值/材料口径
+go run ./cmd/qkdsim -mode estimate -seed 1 -n 4000 -key 16
+
+# 批量会话：可重复 -job 指定多个参数组（名称可选），-workers 控制并发度
+go run ./cmd/qkdsim -mode batch -workers 4 -seed 1 \
+  -job success: \
+  -job eve:eve=true \
+  -job nosig:n=100,loss=40,dark=0.000000000001,key=0 \
+  -job scarce:n=200,key=64
 ```
 
 CLI 会打印输入参数、误码估计、纠正统计与密钥账目，成功时输出十六进制密钥。
+`run` / `estimate` / `batch` 三种模式**复用同一组参数、同一套缺省值与同一结果口径**，
+并不是另一个独立工具。
+
+### CLI 模式
+
+| 模式 | 说明 | 退出码 |
+|---|---|---|
+| `-mode run`（缺省） | 执行单会话，参数、缺省值、日志与输出与历史完全一致 | 成功 0；会话终止/失败 1 |
+| `-mode estimate` | 只做容量预估：打印结论、阶段、**生效阈值**、公开计数、材料口径，不出钥 | `feasible` 0；其余结论 1；入参非法 2 |
+| `-mode batch` | 按 `-job` 列表并发运行多组，每组落位输出审计行；成功打印密钥，失败打印类别/阶段/说明 | 全部成功 0；任一失败 1；任务/参数解析失败 2 |
+
+- `-job` 可重复，形如 `[名称:]key=value,key=value`；`key` 只能是公共参数名
+  （`n/loss/eff/dark/eve/sample/threshold/margin/key/seed`），布尔开关也可裸写 `eve`。
+  未在任务中给出的参数取顶层同名标志值（即缺省值或显式传入值），因此批量与单会话
+  调参方式完全一致；不给任何 `-job` 时，以顶层参数作为唯一任务运行。
+- `-workers` 仅批量模式有效：`<=0` 顺序执行，超过任务数按任务数计；改变它只影响调度，
+  各参数组的审计与密钥逐项不变。
 
 ## 协议参数含义
 
@@ -124,7 +151,8 @@ AfterSample = LeakedEC + LeakedEst + Margin + Final + Discarded
 | `no_signal` | 筛选后无可用事件（无可用信号） | `sift` |
 | `aborted_insecure` | QBER 超阈值，安全判定终止 | `qber_estimate` |
 | `reconcile_failed` | 纠错未收敛 | `reconcile` |
-| `insufficient_material` | 材料不足，细分见 `Detail` | `accounting` |
+| `insufficient_material` | 材料不足，细分见 `Detail` | `accounting`（抽样阶段即抽光时为 `qber_estimate`） |
+| `internal_error` | 非预期内部错误，对外只有固定公开说明 | 实际到达阶段，缺省 `accounting` |
 
 材料不足细分 `Audit.Detail`：`exhausted`（账目可用比特 `<=0`，不可能出钥）、
 `low_yield`（有正材料但不足 1 字节，收益过低）、
@@ -150,6 +178,15 @@ for _, o := range outs {
 - **结构上不含**纠正后比特、筛后可用比特、最终密钥等任何可推导密钥的材料
   （单测以反射白名单保证审计结构无任何 `[]byte/[]int` 切片，并断言序列化文本不出现密钥）；
 - 换失败路径不会混入敏感中间量：无信号时也保留 `Prepared` 等公开计数，成功失败同一结构。
+- **非预期内部错误（`internal_error`）只暴露固定公开类别与说明**
+  （`internal error: unexpected failure; details withheld from public audit`），
+  **绝不转发原始错误文本**——内部错误的 `Error()` 可能在非预期路径里带入纠正后/
+  筛后比特，一律在审计边界剥离；已知错误（校验、无信号、窃听终止、纠错失败、
+  材料不足）的文本均为不含比特内容的固定口径，正常对外。
+- **阶段以执行现场为准**：抽样阶段就把剩余材料抽光（`AfterSample=0`）时，
+  类别仍是 `insufficient_material`、细分 `exhausted`，但 `Stage=qber_estimate`
+  （而非账目阶段）。错误经 `withStage` 包装，`errors.Is/As` 穿透，
+  调用方既有错误判断不变。
 
 ## 目标容量预估（不出钥）
 
@@ -167,7 +204,16 @@ for _, o := range outs {
   `reconcile_failed` / `exhausted` / `low_yield` / `insufficient_for_target`。
   其中 **“还有可能出更短钥”的 `low_yield`、`insufficient_for_target` 与
   “参数矛盾”的 `invalid_config`、“不可能出钥”的 `exhausted` 严格区分**，不会笼统归并。
+- **`QBERThreshold` 始终等于本次真正生效的判定阈值**（缺省语义后的
+  `Params.QBERThreshold`，缺省即 `0.11`）：不跟随实测 `QBER` 变化；参数非法
+  （`invalid_config`）或流程很早结束（`no_signal` 等，`prep.est` 为零值）时
+  也**不会变成 0**。`CapacityEstimate.QBERThreshold` 与 `Params.QBERThreshold`
+  恒等，并与相同参数下真实 `Run` 的审计阈值一致——无论预估成功还是各类失败。
+  `QBER` 字段在未走到误码估计时为 0，但阈值照常反映生效值。
+- 预估全程**不修改传入 `cfg`**（目标只作用于内部克隆），`RequestedBits`
+  恒等于传入目标 `targetKeyBytes*8`，**不缩短、不放大、不静默降级**。
 - `CapacityEstimate` 全部字段为公开口径，结构上无任何比特序列（单测反射保证）。
+  若内部在非预期路径出错，`Reason` 与审计同口径，只给固定公开说明，不转发内部原文。
 
 ## 本地复现验证
 
@@ -176,7 +222,16 @@ for _, o := range outs {
 go run ./cmd/qkdsim -seed 123 -n 4000 | tail -1
 go run ./cmd/qkdsim -seed 123 -n 4000 | tail -1
 
-# 2) 确定性、并发隔离、批量可复现、审计口径、容量一致性由单测保证
+# 2) 容量预估：阈值始终等于生效阈值（非法/早退也不归零），不缩短目标
+go run ./cmd/qkdsim -mode estimate -n 0 -eff 0.9        # invalid_config，阈值仍 0.1100
+go run ./cmd/qkdsim -mode estimate -n 100 -loss 40 -dark 0.000000000001 -key 0  # no_signal
+go run ./cmd/qkdsim -mode estimate -n 4000 -key 10000  # insufficient_for_target
+
+# 3) 批量：同一组 -job 在不同 -workers 下结果逐项一致
+go run ./cmd/qkdsim -mode batch -workers 1 -seed 1 -job a: -job eve:eve=true
+go run ./cmd/qkdsim -mode batch -workers 8 -seed 1 -job a: -job eve:eve=true
+
+# 4) 确定性、并发隔离、批量可复现、审计口径、容量一致性、CLI 新入口由单测保证
 go test -race -v ./...
 ```
 
@@ -184,12 +239,18 @@ go test -race -v ./...
 固定种子重复一致、临界阈值、多会话并行）外，新增：
 
 - **批量并发隔离**：批内重复参数组并发执行，结果与单独 `Run` 逐字节一致、互不串状态；
-- **分组顺序可复现**：打乱提交顺序、切换并发度（顺序/1/2/4/超大），同参数组结果逐项一致；
+- **分组顺序可复现**：打乱提交顺序、切换并发度（顺序/1/2/4/超大），同参数组结果
+  （审计全字段含阶段/阈值/计数与密钥）逐项一致；
 - **安全失败审计**：成功与各失败路径审计口径一致，反射白名单 + 文本断言保证不泄露
   纠正后比特/筛后比特/最终密钥，且无信号路径仍保留公开计数；
+  **任意内部错误原文（含模拟泄露比特）都不出现在审计输出里**，只剩固定公开说明；
+  抽样阶段材料抽光归类为 `qber_estimate/exhausted`；
 - **容量预估一致性**：跨光子数/损耗/窃听/目标的穷举扫描，预估结论与真实执行结局
   一一对应，`feasible` 时预计长度等于实际出钥长度，材料不足三种子类与真实 `Detail` 一致；
-  并校验预估不修改入参、不静默缩短目标。
+  并校验预估不修改入参、不静默缩短目标；
+  **预估阈值在成功/非法/无信号/窃听/耗尽/目标过大/自定义阈值等边界下恒等于生效阈值**；
+- **CLI 入口**：`run`（默认值/输出与历史一致）、`estimate`（阈值口径与各类结论退出码）、
+  `batch`（多任务、命名、混合成败、并发度变化逐项一致、非法任务退出码）均有测试覆盖。
 
 单测日志打印每个场景的输入参数、公开审计行、账目与判定依据；审计行中不含任何密钥材料。
 
@@ -209,11 +270,22 @@ go test -race -v ./...
 | `audit.go` | 统一公开审计：参数摘要、阶段、结局类别、公开计数（结构上不含密钥材料） |
 | `capacity.go` | 目标容量预估：不出钥判定可行性/材料/公开消耗与不足原因 |
 | `batch.go` | 批量会话：固定 worker 池、按提交下标落位、每组隔离可复现 |
-| `cmd/qkdsim` | 本地可运行入口（单会话，行为不变） |
+| `cmd/qkdsim` | 本地可运行入口：`run`（默认，单会话，行为不变）/ `estimate`（容量预估）/ `batch`（批量会话） |
 
 ## 兼容性说明
 
 - 单会话入口 `Run`、`Result`、`Config`、错误（`*AbortError`、`ErrNoSignal`、
   `ErrInsufficientKeyMaterial`）及同种子出钥结果**保持不变**；批量、审计、容量预估均为
-  在现有工程上的增量 API，既有调用方与 CLI 无需改动。
+  在现有工程上的增量 API，既有调用方无需改动。
+- CLI 默认行为、参数名、缺省值（`-n 4000 -loss 5 -eff 0.9 -dark 0.0001 -sample 0.5
+  -threshold 0.11 -margin 32 -key 16 -seed 1`）与成功/失败输出格式**保持不变**：
+  不带 `-mode` 即为原单会话。批量与预估仅通过新增的 `-mode estimate` /
+  `-mode batch`（及批量专用的可重复 `-job`、`-workers`）触发，不是独立工具。
 - 新增 `ErrReconciliationFailed` 用于把“纠错未收敛”标为可区分失败类别（错误文案与历史一致）。
+- 抽样阶段材料抽光的错误内部经 `withStage` 包装（仍是同一个
+  `ErrInsufficientKeyMaterial`，`errors.Is` 成立），仅审计/预估的 `Stage`
+  由 `accounting` 修正为真实的 `qber_estimate`；错误类型与判定结果不变。
+- 容量预估对外阈值由“错误地等于实测 QBER、早退时为 0”修正为“恒等于生效判定阈值”；
+  其余结论、计数、材料口径与 `Run` 的对应关系不变。
+- `internal_error` 的对外 `Reason` 改为固定公开文案（不再可能携带内部原文）；
+  其它结局类别的说明文本不变。

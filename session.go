@@ -142,7 +142,9 @@ func prepareSession(cfg Config) (preparedRun, error) {
 		}
 	}
 	if len(remaining) == 0 {
-		return p, ErrInsufficientKeyMaterial
+		// 抽样把全部筛后材料公开消耗：实际只推进到误码估计阶段，
+		// 显式标注阶段，避免审计把该失败错归到账目阶段。
+		return p, withStage(StageQBEREstimate, ErrInsufficientKeyMaterial)
 	}
 
 	// 5. 取出抽样剩余部分做误码纠正。
